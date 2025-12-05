@@ -642,6 +642,7 @@ dependencies = [
  "rbx_xml",
  "serde",
  "serde_json",
+ "ustr",
 ]
 
 [[package]]

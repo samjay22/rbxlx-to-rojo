@@ -72,7 +72,7 @@ fn repr_instance<'a>(
                 _ => unreachable!(),
             };
 
-            let source = match child.properties.get("Source").expect("no Source") {
+            let source = match child.properties.get(&ustr::ustr("Source")).expect("no Source") {
                 Variant::String(value) => value,
                 _ => unreachable!(),
             }
@@ -169,7 +169,7 @@ fn repr_instance<'a>(
 
         other_class => {
             // When all else fails, we can make a meta folder if there's scripts in it
-            let db = rbx_reflection_database::get();
+            let db = rbx_reflection_database::get().expect("couldn't get reflection database");
             match db.classes.get(other_class) {
                 Some(reflected) => {
                     let treat_as_service = RESPECTED_SERVICES.contains(other_class);
@@ -211,7 +211,7 @@ fn repr_instance<'a>(
             // If there are scripts, we'll need to make a .meta.json folder
             let folder_path: Cow<'a, Path> = Cow::Owned(base.join(&child.name));
             let meta = MetaFile {
-                class_name: Some(child.class.clone()),
+                class_name: Some(child.class.to_string()),
                 // properties: properties.into_iter().collect(),
                 ignore_unknown_instances: true,
             };
@@ -254,9 +254,9 @@ impl<'a, I: InstructionReader + ?Sized> TreeIterator<'a, I> {
                     });
 
                     instructions.push(Instruction::AddToTree {
-                        name: child.name.clone(),
+                        name: child.name.to_string(),
                         partition: TreePartition {
-                            class_name: child.class.clone(),
+                            class_name: child.class.to_string(),
                             children: child
                                 .children()
                                 .iter()
@@ -264,10 +264,10 @@ impl<'a, I: InstructionReader + ?Sized> TreeIterator<'a, I> {
                                 .map(|child_id| {
                                     let child = self.tree.get_by_ref(*child_id).unwrap();
                                     (
-                                        child.name.clone(),
+                                        child.name.to_string(),
                                         Instruction::partition(
                                             &child,
-                                            folder_path.join(&child.name),
+                                            folder_path.join(child.name.as_str()),
                                         ),
                                     )
                                 })

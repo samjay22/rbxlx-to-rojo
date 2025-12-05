@@ -75,14 +75,14 @@ pub enum Instruction<'a> {
 impl<'a> Instruction<'a> {
     pub fn add_to_tree(instance: &Instance, path: PathBuf) -> Self {
         Instruction::AddToTree {
-            name: instance.name.clone(),
+            name: instance.name.to_string(),
             partition: Instruction::partition(&instance, path),
         }
     }
 
     pub fn partition(instance: &Instance, path: PathBuf) -> TreePartition {
         TreePartition {
-            class_name: instance.class.clone(),
+            class_name: instance.class.to_string(),
             children: BTreeMap::new(),
             ignore_unknown_instances: true,
             path: Some(path),
