@@ -1,0 +1,35 @@
+[package]
+name = "rbxlx-to-rojo"
+version = "1.0.1"
+authors = ["Kampfkarren"]
+edition = "2018"
+
+[lib]
+name = "rbxlx_to_rojo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rbxlx-to-rojo"
+path = "src/cli.rs"
+required-features = ["cli"]
+
+[dependencies]
+env_logger = "0.11"
+lazy_static = "1.4"
+log = "0.4"
+rbx_binary = { git = "https://github.com/rojo-rbx/rbx-dom", branch = "master" }
+rbx_dom_weak = { git = "https://github.com/rojo-rbx/rbx-dom", branch = "master" }
+rbx_reflection = { git = "https://github.com/rojo-rbx/rbx-dom", branch = "master" }
+rbx_reflection_database = { git = "https://github.com/rojo-rbx/rbx-dom", branch = "master" }
+rbx_xml = { git = "https://github.com/rojo-rbx/rbx-dom", branch = "master" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# CLI
+nfd = { git = "https://github.com/saurvs/nfd-rs", optional = true }
+
+[dev-dependencies]
+pretty_assertions = "0.6"
+
+[features]
+cli = ["nfd"]
