@@ -1,4 +1,4 @@
-use log::debug;
+use log::{debug, warn};
 use rbx_dom_weak::{
     types::{Ref, Variant},
     Instance, WeakDom,
@@ -20,6 +20,7 @@ mod tests;
 
 lazy_static::lazy_static! {
     static ref NON_TREE_SERVICES: HashSet<&'static str> = include_str!("./non-tree-services.txt").lines().collect();
+    #[allow(dead_code)]
     static ref RESPECTED_SERVICES: HashSet<&'static str> = include_str!("./respected-services.txt").lines().collect();
 }
 
@@ -29,18 +30,48 @@ struct TreeIterator<'a, I: InstructionReader + ?Sized> {
     tree: &'a WeakDom,
 }
 
+const WINDOWS_RESERVED: [&str; 22] = [
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+fn sanitize_component(name: &str) -> String {
+    let mut sanitized: String = name
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            _ => c,
+        })
+        .collect();
+
+    while sanitized.ends_with(' ') || sanitized.ends_with('.') {
+        sanitized.pop();
+    }
+
+    if sanitized.is_empty() {
+        sanitized.push('_');
+    }
+
+    let lower = sanitized.to_ascii_lowercase();
+    if WINDOWS_RESERVED.contains(&lower.as_str()) {
+        sanitized.insert(0, '_');
+    }
+
+    sanitized
+}
+
+fn sanitized_join(base: &Path, name: &str) -> PathBuf {
+    base.join(sanitize_component(name))
+}
+
 fn repr_instance<'a>(
     base: &'a Path,
     child: &'a Instance,
     has_scripts: &'a HashMap<Ref, bool>,
 ) -> Option<(Vec<Instruction<'a>>, Cow<'a, Path>)> {
-    if has_scripts.get(&child.referent()) != Some(&true) {
-        return None;
-    }
-
     match child.class.as_str() {
         "Folder" => {
-            let folder_path = base.join(&child.name);
+            let folder_path = sanitized_join(base, &child.name);
             let owned: Cow<'a, Path> = Cow::Owned(folder_path);
             let clone = owned.clone();
             Some((
@@ -72,16 +103,28 @@ fn repr_instance<'a>(
                 _ => unreachable!(),
             };
 
-            let source = match child.properties.get(&ustr::ustr("Source")).expect("no Source") {
-                Variant::String(value) => value,
-                _ => unreachable!(),
-            }
-            .as_bytes();
+            let source = match child.properties.get(&ustr::ustr("Source")) {
+                Some(Variant::String(value)) => value.as_bytes(),
+                Some(other) => {
+                    warn!("unexpected Source variant for {} ( {:?} ), writing empty file", child.name, other);
+                    &[]
+                }
+                None => {
+                    warn!(
+                        "missing Source on {} ({}), writing empty file",
+                        child.name, child.class
+                    );
+                    &[]
+                }
+            };
 
             if child.children().is_empty() {
                 Some((
                     vec![Instruction::CreateFile {
-                        filename: Cow::Owned(base.join(format!("{}{}.lua", child.name, extension))),
+                        filename: Cow::Owned(sanitized_join(
+                            base,
+                            &format!("{}{}", child.name, extension),
+                        )),
                         contents: Cow::Borrowed(source),
                     }],
                     Cow::Borrowed(base),
@@ -105,12 +148,9 @@ fn repr_instance<'a>(
                     .count();
 
                 let total_children_count = child.children().len();
-                let folder_path: Cow<'a, Path> = Cow::Owned(base.join(&child.name));
+                let folder_path: Cow<'a, Path> = Cow::Owned(sanitized_join(base, &child.name));
 
-                // If there's no script children, make a named meta file
-                // If there's some script children, make a folder with a meta file
-                // If there's only script children, don't bother with a meta file at all
-                // TODO: Lot of redundant code here
+                // Any script with children becomes a folder so its descendants stay nested
                 match script_children_count {
                     _ if script_children_count == total_children_count => Some((
                         vec![
@@ -129,20 +169,21 @@ fn repr_instance<'a>(
 
                     0 => Some((
                         vec![
+                            Instruction::CreateFolder {
+                                folder: folder_path.clone(),
+                            },
                             Instruction::CreateFile {
                                 filename: Cow::Owned(
-                                    base.join(format!("{}{}.lua", child.name, extension)),
+                                    folder_path.join(format!("init{}.lua", extension)),
                                 ),
                                 contents: Cow::Borrowed(source),
                             },
                             Instruction::CreateFile {
-                                filename: Cow::Owned(
-                                    base.join(format!("{}.meta.json", child.name)),
-                                ),
+                                filename: Cow::Owned(folder_path.join("init.meta.json")),
                                 contents: meta_contents,
                             },
                         ],
-                        Cow::Borrowed(base),
+                        folder_path,
                     )),
 
                     _ => Some((
@@ -168,24 +209,13 @@ fn repr_instance<'a>(
         }
 
         other_class => {
-            // When all else fails, we can make a meta folder if there's scripts in it
+            // When all else fails, represent the instance with a meta folder so it isn't lost
             let db = rbx_reflection_database::get().expect("couldn't get reflection database");
             match db.classes.get(other_class) {
                 Some(reflected) => {
-                    let treat_as_service = RESPECTED_SERVICES.contains(other_class);
-                    // Don't represent services not in respected-services
                     let is_service = reflected.tags.contains(&ClassTag::Service);
-                    if is_service && !treat_as_service {
-                        return None;
-                    }
-
-                    if treat_as_service {
-                        // Don't represent empty services
-                        if child.children().is_empty() {
-                            return None;
-                        }
-
-                        let new_base: Cow<'a, Path> = Cow::Owned(base.join(&child.name));
+                    if is_service {
+                        let new_base: Cow<'a, Path> = Cow::Owned(sanitized_join(base, &child.name));
                         let mut instructions = Vec::new();
 
                         if !NON_TREE_SERVICES.contains(other_class) {
@@ -193,11 +223,9 @@ fn repr_instance<'a>(
                                 .push(Instruction::add_to_tree(&child, new_base.to_path_buf()));
                         }
 
-                        if !child.children().is_empty() {
-                            instructions.push(Instruction::CreateFolder {
-                                folder: new_base.clone(),
-                            });
-                        }
+                        instructions.push(Instruction::CreateFolder {
+                            folder: new_base.clone(),
+                        });
 
                         return Some((instructions, new_base));
                     }
@@ -208,8 +236,8 @@ fn repr_instance<'a>(
                 }
             }
 
-            // If there are scripts, we'll need to make a .meta.json folder
-            let folder_path: Cow<'a, Path> = Cow::Owned(base.join(&child.name));
+            // Represent the instance using a .meta.json folder so it persists in the project
+            let folder_path: Cow<'a, Path> = Cow::Owned(sanitized_join(base, &child.name));
             let meta = MetaFile {
                 class_name: Some(child.class.to_string()),
                 // properties: properties.into_iter().collect(),
@@ -245,38 +273,35 @@ impl<'a, I: InstructionReader + ?Sized> TreeIterator<'a, I> {
             let (instructions_to_create_base, path) = if child.class == "StarterPlayer" {
                 // We can't respect StarterPlayer as a service, because then Rojo
                 // tries to delete StarterPlayerScripts and whatnot, which is not valid.
-                let folder_path: Cow<'a, Path> = Cow::Owned(self.path.join(&child.name));
+                let folder_path: Cow<'a, Path> = Cow::Owned(sanitized_join(self.path, &child.name));
                 let mut instructions = Vec::new();
 
-                if has_scripts.get(child_id) == Some(&true) {
-                    instructions.push(Instruction::CreateFolder {
-                        folder: folder_path.clone(),
-                    });
+                instructions.push(Instruction::CreateFolder {
+                    folder: folder_path.clone(),
+                });
 
-                    instructions.push(Instruction::AddToTree {
-                        name: child.name.to_string(),
-                        partition: TreePartition {
-                            class_name: child.class.to_string(),
-                            children: child
-                                .children()
-                                .iter()
-                                .filter(|id| has_scripts.get(id) == Some(&true))
-                                .map(|child_id| {
-                                    let child = self.tree.get_by_ref(*child_id).unwrap();
-                                    (
-                                        child.name.to_string(),
+                instructions.push(Instruction::AddToTree {
+                    name: child.name.to_string(),
+                    partition: TreePartition {
+                        class_name: child.class.to_string(),
+                        children: child
+                            .children()
+                            .iter()
+                            .map(|child_id| {
+                                let child = self.tree.get_by_ref(*child_id).unwrap();
+                                (
+                                    child.name.to_string(),
                                         Instruction::partition(
                                             &child,
-                                            folder_path.join(child.name.as_str()),
+                                            sanitized_join(folder_path.as_ref(), child.name.as_str()),
                                         ),
-                                    )
-                                })
-                                .collect(),
-                            ignore_unknown_instances: true,
-                            path: None,
-                        },
-                    })
-                }
+                                )
+                            })
+                            .collect(),
+                        ignore_unknown_instances: true,
+                        path: None,
+                    },
+                });
 
                 (instructions, folder_path)
             } else {

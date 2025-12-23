@@ -63,20 +63,35 @@ impl InstructionReader for FileSystem {
     fn read_instruction<'a>(&mut self, instruction: Instruction<'a>) {
         match instruction {
             Instruction::AddToTree {
-                name,
+                mut name,
                 mut partition,
             } => {
-                assert!(
-                    self.project.tree.get(&name).is_none(),
-                    "Duplicate item added to tree! Instances can't have the same name: {}",
-                    name
-                );
+                if self.project.tree.contains_key(&name) {
+                    let original = name.clone();
+                    let mut counter = 2;
+                    loop {
+                        let candidate = format!("{}_{}", original, counter);
+                        if !self.project.tree.contains_key(&candidate) {
+                            name = candidate;
+                            break;
+                        }
+                        counter += 1;
+                    }
+
+                    if let Some(path) = partition.path.take() {
+                        let new_path = match path.parent() {
+                            Some(parent) => parent.join(&name),
+                            None => PathBuf::from(&name),
+                        };
+                        partition.path = Some(new_path);
+                    }
+                }
 
                 if let Some(path) = partition.path {
                     partition.path = Some(PathBuf::from(SRC).join(path));
                 }
 
-                for mut child in partition.children.values_mut() {
+                for child in partition.children.values_mut() {
                     if let Some(path) = &child.path {
                         child.path = Some(PathBuf::from(SRC).join(path));
                     }
@@ -86,8 +101,16 @@ impl InstructionReader for FileSystem {
             }
 
             Instruction::CreateFile { filename, contents } => {
-                let mut file = File::create(self.source.join(&filename)).unwrap_or_else(|error| {
-                    panic!("can't create file {:?}: {:?}", filename, error)
+                let full_path = self.source.join(&filename);
+
+                if let Some(parent) = full_path.parent() {
+                    fs::create_dir_all(parent).unwrap_or_else(|error| {
+                        panic!("can't create parent dirs for {:?}: {:?}", full_path, error)
+                    });
+                }
+
+                let mut file = File::create(&full_path).unwrap_or_else(|error| {
+                    panic!("can't create file {:?}: {:?}", full_path, error)
                 });
                 file.write_all(&contents).unwrap_or_else(|error| {
                     panic!("can't write to file {:?} due to {:?}", filename, error)

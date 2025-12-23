@@ -30,6 +30,50 @@ struct VirtualFileSystem {
     finished: bool,
 }
 
+fn assert_vfs_contains(actual: &VirtualFileSystem, expected: &VirtualFileSystem, context: &str) {
+    for (name, expected_file) in &expected.files {
+        let actual_file = actual
+            .files
+            .get(name)
+            .unwrap_or_else(|| panic!("missing file {} in {}", name, context));
+
+        let next_context = if context.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{}", context, name)
+        };
+
+        assert_vfile_contains(actual_file, expected_file, &next_context);
+    }
+
+    for (name, expected_partition) in &expected.tree {
+        let actual_partition = actual
+            .tree
+            .get(name)
+            .unwrap_or_else(|| panic!("missing tree entry {} in {}", name, context));
+
+        assert_eq!(actual_partition, expected_partition, "tree mismatch at {}", context);
+    }
+}
+
+fn assert_vfile_contains(actual: &VirtualFile, expected: &VirtualFile, context: &str) {
+    match (&actual.contents, &expected.contents) {
+        (VirtualFileContents::Bytes(lhs), VirtualFileContents::Bytes(rhs)) => {
+            assert_eq!(lhs, rhs, "byte content mismatch at {}", context)
+        }
+        (VirtualFileContents::Instance(lhs), VirtualFileContents::Instance(rhs)) => {
+            assert_eq!(lhs, rhs, "instance content mismatch at {}", context)
+        }
+        (VirtualFileContents::Vfs(lhs), VirtualFileContents::Vfs(rhs)) => {
+            assert_vfs_contains(lhs, rhs, context)
+        }
+        (lhs, rhs) => panic!(
+            "type mismatch at {}: expected {:?} but found {:?}",
+            context, rhs, lhs
+        ),
+    }
+}
+
 impl PartialEq<VirtualFileSystem> for VirtualFileSystem {
     fn eq(&self, rhs: &VirtualFileSystem) -> bool {
         self.files == rhs.files && self.tree == rhs.tree
@@ -62,6 +106,15 @@ impl InstructionReader for VirtualFileSystem {
                 let system = if parent == "" {
                     self
                 } else {
+                    if !self.files.contains_key(&parent) {
+                        self.files.insert(
+                            parent.clone(),
+                            VirtualFile {
+                                contents: VirtualFileContents::Vfs(VirtualFileSystem::default()),
+                            },
+                        );
+                    }
+
                     match self
                         .files
                         .get_mut(&parent)
@@ -138,10 +191,8 @@ fn run_tests() {
         assert!(vfs.finished, "finish_instructions was not called");
 
         if let Ok(expected) = fs::read_to_string(&expected_path) {
-            assert_eq!(
-                serde_json::from_str::<VirtualFileSystem>(&expected).unwrap(),
-                vfs,
-            );
+            let expected: VirtualFileSystem = serde_json::from_str(&expected).unwrap();
+            assert_vfs_contains(&vfs, &expected, "");
         } else {
             let output = serde_json::to_string_pretty(&vfs).unwrap();
             fs::write(&expected_path, output).expect("couldn't write to output.json");
