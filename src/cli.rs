@@ -1,5 +1,5 @@
 use log::info;
-use rbxlx_to_rojo::{filesystem::FileSystem, process_instructions};
+use rbxlx_to_rojo::{filesystem::FileSystem, process_instructions, ExportMode};
 use std::{
     borrow::Cow,
     fmt, fs,
@@ -94,8 +94,16 @@ fn routine() -> Result<(), Problem> {
     info!("rbxlx-to-rojo {}", env!("CARGO_PKG_VERSION"));
 
     info!("Select a place file.");
-    let file_path = PathBuf::from(match std::env::args().nth(1) {
-        Some(text) => text,
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let scripts_only = if let Some(pos) = args.iter().position(|a| a == "--scripts-only") {
+        args.remove(pos);
+        true
+    } else {
+        false
+    };
+
+    let file_path = PathBuf::from(match args.get(0) {
+        Some(text) => text.clone(),
         None => match nfd::open_file_dialog(Some("rbxl,rbxm,rbxlx,rbxmx"), None)
             .map_err(|error| Problem::NFDError(error.to_string()))?
         {
@@ -129,8 +137,8 @@ fn routine() -> Result<(), Problem> {
     }?;
 
     info!("Select the path to put your Rojo project in.");
-    let root = PathBuf::from(match std::env::args().nth(2) {
-        Some(text) => text,
+    let root = PathBuf::from(match args.get(1) {
+        Some(text) => text.clone(),
         None => match nfd::open_pick_folder(Some(&file_path.parent().unwrap().to_string_lossy()))
             .map_err(|error| Problem::NFDError(error.to_string()))?
         {
@@ -148,7 +156,8 @@ fn routine() -> Result<(), Problem> {
     );
 
     info!("Starting processing, please wait a bit...");
-    process_instructions(&tree, &mut filesystem);
+    let mode = if scripts_only { ExportMode::ScriptsOnly } else { ExportMode::Full };
+    process_instructions(&tree, &mut filesystem, mode);
     info!("Done! Check rbxlx-to-rojo.log for a full log.");
     Ok(())
 }

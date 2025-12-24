@@ -1,4 +1,4 @@
-use crate::{filesystem::FileSystem, process_instructions, structures::*};
+use crate::{filesystem::FileSystem, process_instructions, structures::*, ExportMode};
 use log::info;
 use pretty_assertions::assert_eq;
 use rbx_dom_weak::types::Variant;
@@ -179,7 +179,7 @@ fn run_tests() {
 
         let mut vfs = VirtualFileSystem::default();
         let time = Instant::now();
-        process_instructions(&tree, &mut vfs);
+        process_instructions(&tree, &mut vfs, ExportMode::Full);
         info!(
             "processing instructions for {:?} took {}ms",
             path,
@@ -209,6 +209,6 @@ fn run_tests() {
         fs::create_dir(&filesystem_path).unwrap();
 
         let mut filesystem = FileSystem::from_root(filesystem_path);
-        process_instructions(&tree, &mut filesystem);
+        process_instructions(&tree, &mut filesystem, ExportMode::Full);
     }
 }

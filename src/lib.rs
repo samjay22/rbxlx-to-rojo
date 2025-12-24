@@ -1,7 +1,7 @@
 use log::{debug, warn};
 use rbx_dom_weak::{
     types::{Ref, Variant},
-    Instance, WeakDom,
+    Instance, InstanceBuilder, WeakDom,
 };
 use rbx_reflection::ClassTag;
 use std::{
@@ -24,10 +24,30 @@ lazy_static::lazy_static! {
     static ref RESPECTED_SERVICES: HashSet<&'static str> = include_str!("./respected-services.txt").lines().collect();
 }
 
+#[derive(Clone, Copy)]
+pub enum ExportMode {
+    Full,
+    ScriptsOnly,
+}
+
 struct TreeIterator<'a, I: InstructionReader + ?Sized> {
     instruction_reader: &'a mut I,
     path: &'a Path,
     tree: &'a WeakDom,
+    mode: ExportMode,
+}
+
+#[derive(Clone, Copy)]
+enum ChildTraversal {
+    Normal,
+    ScriptsOnly,
+    Skip,
+}
+
+struct Representation<'a> {
+    instructions: Vec<Instruction<'a>>,
+    path: Cow<'a, Path>,
+    traversal: ChildTraversal,
 }
 
 const WINDOWS_RESERVED: [&str; 22] = [
@@ -35,11 +55,31 @@ const WINDOWS_RESERVED: [&str; 22] = [
     "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
 
+fn is_script_class(class_name: &str) -> bool {
+    matches!(class_name, "Script" | "LocalScript" | "ModuleScript")
+}
+
+fn should_skip_service(class_name: &str) -> bool {
+    let db = match rbx_reflection_database::get() {
+        Ok(db) => db,
+        Err(error) => {
+            warn!("couldn't get reflection database: {:?}", error);
+            return false;
+        }
+    };
+
+    match db.classes.get(class_name) {
+        Some(reflected) => reflected.tags.contains(&ClassTag::Service) && !RESPECTED_SERVICES.contains(class_name),
+        None => false,
+    }
+}
+
 fn sanitize_component(name: &str) -> String {
     let mut sanitized: String = name
         .chars()
         .map(|c| match c {
             '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
             _ => c,
         })
         .collect();
@@ -64,18 +104,71 @@ fn sanitized_join(base: &Path, name: &str) -> PathBuf {
     base.join(sanitize_component(name))
 }
 
+fn clone_without_scripts(
+    source: &WeakDom,
+    source_ref: Ref,
+    target: &mut WeakDom,
+    parent: Ref,
+) -> Option<Ref> {
+    let instance = source.get_by_ref(source_ref)?;
+
+    if is_script_class(instance.class.as_str()) {
+        return None;
+    }
+
+    let mut builder = InstanceBuilder::new(instance.class.clone()).with_name(instance.name.clone());
+
+    for (key, value) in instance.properties.iter() {
+        builder = builder.with_property(key.clone(), value.clone());
+    }
+
+    let new_ref = target.insert(parent, builder);
+
+    for child_ref in instance.children() {
+        clone_without_scripts(source, *child_ref, target, new_ref);
+    }
+
+    Some(new_ref)
+}
+
+fn serialize_instance_to_rbxm(tree: &WeakDom, instance: &Instance) -> Option<Vec<u8>> {
+    let mut dom = WeakDom::new(InstanceBuilder::new("DataModel").with_name("DataModel"));
+    let dom_root = dom.root_ref();
+
+    let Some(root_ref) = clone_without_scripts(tree, instance.referent(), &mut dom, dom_root) else {
+        return None;
+    };
+
+    let mut bytes = Vec::new();
+
+    match rbx_xml::to_writer_default(&mut bytes, &dom, &[root_ref]) {
+        Ok(()) => Some(bytes),
+        Err(error) => {
+            warn!("couldn't serialize {} to rbxm: {:?}", instance.name, error);
+            None
+        }
+    }
+}
 fn repr_instance<'a>(
+    tree: &'a WeakDom,
     base: &'a Path,
     child: &'a Instance,
     has_scripts: &'a HashMap<Ref, bool>,
-) -> Option<(Vec<Instruction<'a>>, Cow<'a, Path>)> {
+    mode: ExportMode,
+) -> Option<Representation<'a>> {
+    let contains_scripts = has_scripts.get(&child.referent()).copied().unwrap_or(false);
+
     match child.class.as_str() {
         "Folder" => {
+            if matches!(mode, ExportMode::ScriptsOnly) && !contains_scripts {
+                return None;
+            }
+
             let folder_path = sanitized_join(base, &child.name);
             let owned: Cow<'a, Path> = Cow::Owned(folder_path);
             let clone = owned.clone();
-            Some((
-                vec![
+            Some(Representation {
+                instructions: vec![
                     Instruction::CreateFolder { folder: clone },
                     Instruction::CreateFile {
                         filename: Cow::Owned(owned.join("init.meta.json")),
@@ -91,15 +184,16 @@ fn repr_instance<'a>(
                         ),
                     },
                 ],
-                owned,
-            ))
+                path: owned,
+                traversal: ChildTraversal::Normal,
+            })
         }
 
         "Script" | "LocalScript" | "ModuleScript" => {
             let extension = match child.class.as_str() {
-                "Script" => ".server",
-                "LocalScript" => ".client",
-                "ModuleScript" => "",
+                "Script" => ".server.luau",
+                "LocalScript" => ".client.luau",
+                "ModuleScript" => ".luau",
                 _ => unreachable!(),
             };
 
@@ -119,16 +213,17 @@ fn repr_instance<'a>(
             };
 
             if child.children().is_empty() {
-                Some((
-                    vec![Instruction::CreateFile {
+                Some(Representation {
+                    instructions: vec![Instruction::CreateFile {
                         filename: Cow::Owned(sanitized_join(
                             base,
                             &format!("{}{}", child.name, extension),
                         )),
                         contents: Cow::Borrowed(source),
                     }],
-                    Cow::Borrowed(base),
-                ))
+                    path: Cow::Borrowed(base),
+                    traversal: ChildTraversal::Skip,
+                })
             } else {
                 let meta_contents = Cow::Owned(
                     serde_json::to_string_pretty(&MetaFile {
@@ -152,8 +247,8 @@ fn repr_instance<'a>(
 
                 // Any script with children becomes a folder so its descendants stay nested
                 match script_children_count {
-                    _ if script_children_count == total_children_count => Some((
-                        vec![
+                    _ if script_children_count == total_children_count => Some(Representation {
+                        instructions: vec![
                             Instruction::CreateFolder {
                                 folder: folder_path.clone(),
                             },
@@ -164,11 +259,12 @@ fn repr_instance<'a>(
                                 contents: Cow::Borrowed(source),
                             },
                         ],
-                        folder_path,
-                    )),
+                        path: folder_path,
+                        traversal: ChildTraversal::Normal,
+                    }),
 
-                    0 => Some((
-                        vec![
+                    0 => Some(Representation {
+                        instructions: vec![
                             Instruction::CreateFolder {
                                 folder: folder_path.clone(),
                             },
@@ -183,11 +279,12 @@ fn repr_instance<'a>(
                                 contents: meta_contents,
                             },
                         ],
-                        folder_path,
-                    )),
+                        path: folder_path,
+                        traversal: ChildTraversal::Normal,
+                    }),
 
-                    _ => Some((
-                        vec![
+                    _ => Some(Representation {
+                        instructions: vec![
                             Instruction::CreateFolder {
                                 folder: folder_path.clone(),
                             },
@@ -202,19 +299,27 @@ fn repr_instance<'a>(
                                 contents: meta_contents,
                             },
                         ],
-                        folder_path,
-                    )),
+                        path: folder_path,
+                        traversal: ChildTraversal::Normal,
+                    }),
                 }
             }
         }
 
         other_class => {
-            // When all else fails, represent the instance with a meta folder so it isn't lost
             let db = rbx_reflection_database::get().expect("couldn't get reflection database");
             match db.classes.get(other_class) {
                 Some(reflected) => {
                     let is_service = reflected.tags.contains(&ClassTag::Service);
                     if is_service {
+                        if matches!(mode, ExportMode::ScriptsOnly) && !contains_scripts {
+                            return None;
+                        }
+
+                        if !RESPECTED_SERVICES.contains(other_class) {
+                            return None;
+                        }
+
                         let new_base: Cow<'a, Path> = Cow::Owned(sanitized_join(base, &child.name));
                         let mut instructions = Vec::new();
 
@@ -227,7 +332,11 @@ fn repr_instance<'a>(
                             folder: new_base.clone(),
                         });
 
-                        return Some((instructions, new_base));
+                        return Some(Representation {
+                            instructions,
+                            path: new_base,
+                            traversal: ChildTraversal::Normal,
+                        });
                     }
                 }
 
@@ -236,43 +345,75 @@ fn repr_instance<'a>(
                 }
             }
 
-            // Represent the instance using a .meta.json folder so it persists in the project
+            if matches!(mode, ExportMode::ScriptsOnly) && !contains_scripts {
+                return None;
+            }
+
             let folder_path: Cow<'a, Path> = Cow::Owned(sanitized_join(base, &child.name));
-            let meta = MetaFile {
-                class_name: Some(child.class.to_string()),
-                // properties: properties.into_iter().collect(),
-                ignore_unknown_instances: true,
+
+            let mut instructions = vec![Instruction::CreateFolder {
+                folder: folder_path.clone(),
+            }];
+
+            let traversal = if contains_scripts {
+                if matches!(mode, ExportMode::ScriptsOnly) {
+                    ChildTraversal::ScriptsOnly
+                } else {
+                    let model_bytes = serialize_instance_to_rbxm(tree, child)?;
+                    instructions.push(Instruction::CreateFile {
+                        filename: Cow::Owned(folder_path.join("init.rbxmx")),
+                        contents: Cow::Owned(model_bytes),
+                    });
+                    ChildTraversal::ScriptsOnly
+                }
+            } else {
+                ChildTraversal::Skip
             };
 
-            Some((
-                vec![
-                    Instruction::CreateFolder {
-                        folder: folder_path.clone(),
-                    },
-                    Instruction::CreateFile {
-                        filename: Cow::Owned(folder_path.join("init.meta.json")),
-                        contents: Cow::Owned(
-                            serde_json::to_string_pretty(&meta)
-                                .expect("couldn't serialize meta")
-                                .as_bytes()
-                                .into(),
-                        ),
-                    },
-                ],
-                folder_path,
-            ))
+            Some(Representation {
+                instructions,
+                path: folder_path,
+                traversal,
+            })
         }
     }
 }
 
 impl<'a, I: InstructionReader + ?Sized> TreeIterator<'a, I> {
-    fn visit_instructions(&mut self, instance: &Instance, has_scripts: &HashMap<Ref, bool>) {
+    fn visit_instructions(
+        &mut self,
+        instance: &Instance,
+        has_scripts: &HashMap<Ref, bool>,
+        scripts_only: bool,
+    ) {
         for child_id in instance.children() {
             let child = self.tree.get_by_ref(*child_id).expect("got fake child id?");
 
-            let (instructions_to_create_base, path) = if child.class == "StarterPlayer" {
-                // We can't respect StarterPlayer as a service, because then Rojo
-                // tries to delete StarterPlayerScripts and whatnot, which is not valid.
+            if matches!(self.mode, ExportMode::ScriptsOnly) && !has_scripts.get(child_id).copied().unwrap_or(false) {
+                continue;
+            }
+
+            if scripts_only && !is_script_class(child.class.as_str()) {
+                if *has_scripts.get(child_id).unwrap_or(&false) {
+                    let next_path = sanitized_join(self.path, &child.name);
+
+                    TreeIterator {
+                        instruction_reader: self.instruction_reader,
+                        path: next_path.as_path(),
+                        tree: self.tree,
+                        mode: self.mode,
+                    }
+                    .visit_instructions(child, has_scripts, true);
+                }
+
+                continue;
+            }
+
+            if should_skip_service(child.class.as_str()) {
+                continue;
+            }
+
+            let representation = if child.class == "StarterPlayer" {
                 let folder_path: Cow<'a, Path> = Cow::Owned(sanitized_join(self.path, &child.name));
                 let mut instructions = Vec::new();
 
@@ -291,10 +432,10 @@ impl<'a, I: InstructionReader + ?Sized> TreeIterator<'a, I> {
                                 let child = self.tree.get_by_ref(*child_id).unwrap();
                                 (
                                     child.name.to_string(),
-                                        Instruction::partition(
-                                            &child,
-                                            sanitized_join(folder_path.as_ref(), child.name.as_str()),
-                                        ),
+                                    Instruction::partition(
+                                        &child,
+                                        sanitized_join(folder_path.as_ref(), child.name.as_str()),
+                                    ),
                                 )
                             })
                             .collect(),
@@ -303,25 +444,39 @@ impl<'a, I: InstructionReader + ?Sized> TreeIterator<'a, I> {
                     },
                 });
 
-                (instructions, folder_path)
+                Some(Representation {
+                    instructions,
+                    path: folder_path,
+                    traversal: ChildTraversal::Normal,
+                })
             } else {
-                match repr_instance(&self.path, child, has_scripts) {
-                    Some((instructions_to_create_base, path)) => {
-                        (instructions_to_create_base, path)
-                    }
-                    None => continue,
-                }
+                repr_instance(self.tree, self.path, child, has_scripts, self.mode)
             };
 
-            self.instruction_reader
-                .read_instructions(instructions_to_create_base);
+            let Some(representation) = representation else {
+                continue;
+            };
 
-            TreeIterator {
+            let Representation {
+                instructions,
+                path,
+                traversal,
+            } = representation;
+
+            self.instruction_reader.read_instructions(instructions);
+
+            let mut iterator = TreeIterator {
                 instruction_reader: self.instruction_reader,
-                path: &path,
+                path: path.as_ref(),
                 tree: self.tree,
+                mode: self.mode,
+            };
+
+            match traversal {
+                ChildTraversal::Normal => iterator.visit_instructions(child, has_scripts, scripts_only),
+                ChildTraversal::ScriptsOnly => iterator.visit_instructions(child, has_scripts, true),
+                ChildTraversal::Skip => {}
             }
-            .visit_instructions(child, has_scripts);
         }
     }
 }
@@ -352,7 +507,11 @@ fn check_has_scripts(
     result
 }
 
-pub fn process_instructions(tree: &WeakDom, instruction_reader: &mut dyn InstructionReader) {
+pub fn process_instructions(
+    tree: &WeakDom,
+    instruction_reader: &mut dyn InstructionReader,
+    mode: ExportMode,
+) {
     let root = tree.root_ref();
     let root_instance = tree.get_by_ref(root).expect("fake root id?");
     let path = PathBuf::new();
@@ -364,8 +523,9 @@ pub fn process_instructions(tree: &WeakDom, instruction_reader: &mut dyn Instruc
         instruction_reader,
         path: &path,
         tree,
+        mode,
     }
-    .visit_instructions(&root_instance, &has_scripts);
+    .visit_instructions(&root_instance, &has_scripts, false);
 
     instruction_reader.finish_instructions();
 }
